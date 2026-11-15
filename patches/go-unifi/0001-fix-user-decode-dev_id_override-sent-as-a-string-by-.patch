@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ross McKelvie <iam@rossmckelvie.com>
+Date: Sat, 7 Nov 2026 10:20:57 -0600
+Subject: [PATCH] fix(user): decode dev_id_override sent as a string by UniFi
+ Network 11
+
+Backport of the main-branch fix to release/v1.11.
+
+UniFi Network 11 returns a client's dev_id_override as a numeric string
+("3263") where earlier controllers returned a number. User.DevIdOverride is
+an int with no custom decoder, so decoding any client that has a device-type
+override fails and the whole User is unreadable:
+
+  unable to unmarshal alias: json: cannot unmarshal string into Go struct
+  field .Alias.dev_id_override of type int
+
+Register the field with emptyStringInt, as last_seen already is. On this
+branch go generate pulls the latest controller fields, so user.generated.go
+is edited to match what the generator emits for the new registration.
+
+emptyStringInt also treats a JSON null as zero, as it already does on main.
+Without that, a field that moves to emptyStringInt would start failing on
+null where a plain int ignored it.
+---
+ codegen/resources.go         |  2 +-
+ unifi/json.go                |  2 +-
+ unifi/user.generated.go      |  4 +++-
+ unifi/user_unmarshal_test.go | 37 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 42 insertions(+), 3 deletions(-)
+ create mode 100644 unifi/user_unmarshal_test.go
+
+diff --git a/codegen/resources.go b/codegen/resources.go
+index e9a5940..68f0d9f 100644
+--- a/codegen/resources.go
++++ b/codegen/resources.go
+@@ -425,7 +425,7 @@ func customizeBaseType(resource *Resource) {
+ 		baseType.Fields["Type"] = NewFieldInfo("Type", "type", "string", "", "", true, false, "")
+ 	case resource.StructName == "User":
+ 		baseType.Fields[" IP"] = NewFieldInfo("IP", "ip", "string", createValidations(false, validation{v: ip}), "non-generated field", true, false, "")
+-		baseType.Fields[" DevIdOverride"] = NewFieldInfo("DevIdOverride", "dev_id_override", "int", "", "non-generated field", true, false, "")
++		baseType.Fields[" DevIdOverride"] = NewFieldInfo("DevIdOverride", "dev_id_override", "int", "", "non-generated field", true, false, "emptyStringInt")
+ 	case resource.StructName == "WLAN":
+ 		// this field removed in v6, retaining for backwards compatibility
+ 		baseType.Fields["WLANGroupID"] = NewFieldInfo("WLANGroupID", "wlangroup_id", "string", "", "", false, false, "")
+diff --git a/unifi/json.go b/unifi/json.go
+index df96544..32a9e6e 100644
+--- a/unifi/json.go
++++ b/unifi/json.go
+@@ -48,7 +48,7 @@ func (e *emptyStringInt) UnmarshalJSON(b []byte) error {
+ 		return nil
+ 	}
+ 	s := string(b)
+-	if s == `""` {
++	if s == `""` || s == "null" {
+ 		*e = 0
+ 		return nil
+ 	}
+diff --git a/unifi/user.generated.go b/unifi/user.generated.go
+index c96960a..eede461 100644
+--- a/unifi/user.generated.go
++++ b/unifi/user.generated.go
+@@ -52,7 +52,8 @@ func (dst *User) UnmarshalJSON(b []byte) error {
+ 	aux := &struct {
+ 		*Alias
+ 
+-		LastSeen emptyStringInt `json:"last_seen"`
++		DevIdOverride emptyStringInt `json:"dev_id_override"`
++		LastSeen      emptyStringInt `json:"last_seen"`
+ 	}{
+ 		Alias: (*Alias)(dst),
+ 	}
+@@ -61,6 +62,7 @@ func (dst *User) UnmarshalJSON(b []byte) error {
+ 	if err != nil {
+ 		return fmt.Errorf("unable to unmarshal alias: %w", err)
+ 	}
++	dst.DevIdOverride = int(aux.DevIdOverride)
+ 	dst.LastSeen = int(aux.LastSeen)
+ 
+ 	return nil
+diff --git a/unifi/user_unmarshal_test.go b/unifi/user_unmarshal_test.go
+new file mode 100644
+index 0000000..cb28cbb
+--- /dev/null
++++ b/unifi/user_unmarshal_test.go
+@@ -0,0 +1,37 @@
++package unifi //nolint: testpackage
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestUserUnmarshalDevIdOverride covers the forms dev_id_override arrives in.
++// UniFi Network 11 sends a numeric string ("3263") where earlier controllers
++// sent a number; a decode failure here makes the whole User unreadable.
++func TestUserUnmarshalDevIdOverride(t *testing.T) {
++	t.Parallel()
++
++	cases := map[string]struct {
++		input string
++		want  int
++	}{
++		"number":         {input: `{"mac":"aa:bb:cc:dd:ee:ff","dev_id_override":3263}`, want: 3263},
++		"numeric string": {input: `{"mac":"aa:bb:cc:dd:ee:ff","dev_id_override":"3263"}`, want: 3263},
++		"empty string":   {input: `{"mac":"aa:bb:cc:dd:ee:ff","dev_id_override":""}`, want: 0},
++		"null":           {input: `{"mac":"aa:bb:cc:dd:ee:ff","dev_id_override":null}`, want: 0},
++		"absent":         {input: `{"mac":"aa:bb:cc:dd:ee:ff"}`, want: 0},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			var u User
++			require.NoError(t, json.Unmarshal([]byte(tc.input), &u))
++			assert.Equal(t, tc.want, u.DevIdOverride)
++			assert.Equal(t, "aa:bb:cc:dd:ee:ff", u.MAC)
++		})
++	}
++}
+
+base-commit: fa73d3cbd56d864d4f310c79ba006a7fbbf4cee0

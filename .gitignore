@@ -1,0 +1,10 @@
+# Upstream checkouts from scripts/prepare-source.sh and build outputs
+/upstream/
+/release/
+dist/
+prepare.log
+notes.md
+
+.claude/settings.local.json
+.claude/.cc-writes/
+.DS_Store

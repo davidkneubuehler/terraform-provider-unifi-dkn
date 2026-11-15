@@ -1,0 +1,38 @@
+# Builds the patched provider in the checkout that scripts/prepare-source.sh
+# creates. Run it from DEST/terraform-provider-unifi with
+# `--config <this repo>/.goreleaser.yml`; the workflow publishes the release.
+version: 2
+
+project_name: terraform-provider-unifi
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - "-s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }}"
+    targets:
+      - darwin_amd64
+      - darwin_arm64
+      - linux_amd64
+      - linux_arm64
+    binary: "{{ .ProjectName }}_v{{ .Version }}"
+
+archives:
+  - formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Provider zips hold only the binary, as on the registries.
+    files:
+      - none*
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  disable: true
