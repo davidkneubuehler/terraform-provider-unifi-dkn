@@ -1,0 +1,197 @@
+name: Release
+
+# Builds filipowm/terraform-provider-unifi at the tag in UPSTREAM_VERSION with
+# patches/ applied (to the provider and to go-unifi), and publishes it as the
+# GitHub release vX.Y.Z-dkn.N with registry-style zips and SHA256SUMS.
+# Upstream is checked out inside the run and never pushed anywhere.
+# Pushes and pull requests only apply the patches, test and build. A manual
+# dispatch on main also attests and publishes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish a new revision even if the newest one already has the current patches.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  # Files whose change makes a new revision of the same upstream release.
+  BUILD_INPUTS: UPSTREAM_VERSION patches scripts .goreleaser.yml
+  GORELEASER_VERSION: v2.19.0
+
+jobs:
+  build:
+    name: Apply patches, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.revision.outputs.release_tag }}
+      publish: ${{ steps.revision.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Choose revision
+        id: revision
+        env:
+          FORCE: ${{ inputs.force == true }}
+          PUBLISH_RUN: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          latest=$(git tag -l "$version-dkn.*" | sed "s/^$version-dkn\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          publish=$PUBLISH_RUN
+          # shellcheck disable=SC2086 # BUILD_INPUTS is a list of paths
+          if [ -n "$latest" ] && [ "$FORCE" != true ] \
+            && git diff --quiet "$version-dkn.$latest" HEAD -- $BUILD_INPUTS; then
+            echo "$version-dkn.$latest already has the current patches; nothing to publish." | tee -a "$GITHUB_STEP_SUMMARY"
+            publish=false
+          fi
+          release_tag="$version-dkn.$((${latest:-0} + 1))"
+          {
+            echo "release_tag=$release_tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $release_tag (publish: $publish)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply patches
+        run: |
+          set -o pipefail
+          scripts/prepare-source.sh upstream 2>&1 | tee prepare.log
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: upstream/terraform-provider-unifi/go.mod
+          cache-dependency-path: |
+            upstream/terraform-provider-unifi/go.sum
+            upstream/go-unifi/go.sum
+
+      - name: Test go-unifi
+        if: hashFiles('upstream/go-unifi/go.mod') != ''
+        working-directory: upstream/go-unifi
+        run: go test ./unifi/...
+
+      - name: Test provider
+        working-directory: upstream/terraform-provider-unifi
+        # The acceptance tests need a UniFi controller in Docker; run the unit tests.
+        run: |
+          go vet ./...
+          go list ./... | grep -v /internal/provider/acctest | xargs go test
+
+      # GoReleaser takes the version from a tag on the patched commit. The tag
+      # exists only in the local upstream checkout.
+      - name: Tag patched checkout
+        env:
+          RELEASE_TAG: ${{ steps.revision.outputs.release_tag }}
+        run: git -C upstream/terraform-provider-unifi tag "$RELEASE_TAG"
+
+      - name: Build
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        env:
+          GORELEASER_CURRENT_TAG: ${{ steps.revision.outputs.release_tag }}
+        with:
+          distribution: goreleaser
+          version: ${{ env.GORELEASER_VERSION }}
+          workdir: upstream/terraform-provider-unifi
+          args: release --clean --config ${{ github.workspace }}/.goreleaser.yml
+
+      - name: Collect release files
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp upstream/terraform-provider-unifi/dist/*.zip upstream/terraform-provider-unifi/dist/*_SHA256SUMS release/
+          (cd release && sha256sum -c ./*_SHA256SUMS)
+          cp prepare.log release/
+          ls -l release
+
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: release/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Attest and publish
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: release
+
+      - name: Verify checksums
+        working-directory: release
+        run: sha256sum -c ./*_SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.zip
+            release/*_SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          version=${RELEASE_TAG#v}
+          {
+            echo "Patched build of [filipowm/terraform-provider-unifi $upstream](https://github.com/filipowm/terraform-provider-unifi/releases/tag/$upstream)."
+            echo
+            echo "Upstream sources:"
+            echo
+            grep -E '^(terraform-provider-unifi|go-unifi) v[0-9.]+: [0-9a-f]{40}$' release/prepare.log | sed 's/^/- /'
+            echo
+            echo "Patches:"
+            echo
+            sed -n 's/^Applied /- /p' release/prepare.log
+            echo
+            echo "Use it from an OpenTofu filesystem mirror as \`filipowm/unifi\` version \`= $version\`; see the [README](https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_TAG/README.md#using-a-release)."
+            echo
+            echo "Verify a download:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c --ignore-missing terraform-provider-unifi_${version}_SHA256SUMS"
+            echo "gh attestation verify terraform-provider-unifi_${version}_SHA256SUMS -R $GITHUB_REPOSITORY"
+            echo '```'
+          } > notes.md
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "$RELEASE_TAG" \
+            --notes-file notes.md \
+            release/*.zip release/*_SHA256SUMS
+          echo "Published $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
